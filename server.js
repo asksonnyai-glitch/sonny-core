@@ -9,6 +9,7 @@ app.use(morgan("tiny"));
 
 const API_KEY = process.env.API_KEY || "";
 
+// Bearer auth
 function auth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -18,10 +19,12 @@ function auth(req, res, next) {
   next();
 }
 
+// Health (no auth)
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "Sonny Core", ts: Date.now() });
 });
 
+// Alexa speech ingest → returns SSML
 app.post("/voice/ingest", auth, (req, res) => {
   const { text = "", sessionId = "", userId = "" } = req.body || {};
   const lower = String(text).toLowerCase().trim();
@@ -37,9 +40,11 @@ app.post("/voice/ingest", auth, (req, res) => {
   return res.json({ ok: true, ssml, session: { sessionId, userId } });
 });
 
+// Actions stub
 app.post("/actions/create", auth, (req, res) => {
   const { type = "note", payload = {} } = req.body || {};
-  return res.json({ ok: true, id: \`act_\${Date.now()}\`, type, status: "queued" });
+  // ✅ FIXED template literal
+  return res.json({ ok: true, id: `act_${Date.now()}`, type, status: "queued" });
 });
 
 function escapeForSSML(s) {
@@ -47,4 +52,4 @@ function escapeForSSML(s) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(\`Sonny Core listening on \${PORT}\`));
+app.listen(PORT, () => console.log(`Sonny Core listening on ${PORT}`));
