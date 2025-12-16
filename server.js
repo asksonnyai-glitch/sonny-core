@@ -1,13 +1,17 @@
-// server.js — Sonny Core (Express + ChatGPT + Google OAuth/Gmail)
+// server.js — Sonny Core (Express + ChatGPT + Google OAuth/Gmail + file persistence)
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(morgan("tiny"));
 
+// ---- Env ----
 const API_KEY = process.env.API_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
@@ -16,8 +20,37 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "";
 
-// Very simple in-memory token store (demo only)
-const TOKENS = new Map(); // key: userId, value: { access_token, refresh_token, expiry_date, scope, token_type }
+// ---- File-based token persistence ----
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const TOKENS_FILE = process.env.TOKENS_FILE || path.join(__dirname, "data", "tokens.json");
+
+function ensureDirFor(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+function loadTokensFromFile() {
+  try {
+    if (!fs.existsSync(TOKENS_FILE)) return {};
+    const raw = fs.readFileSync(TOKENS_FILE, "utf8");
+    return JSON.parse(raw || "{}");
+  } catch (e) {
+    console.error("loadTokensFromFile error:", e);
+    return {};
+  }
+}
+function saveTokensToFile(obj) {
+  try {
+    ensureDirFor(TOKENS_FILE);
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(obj, null, 2), "utf8");
+  } catch (e) {
+    console.error("saveTokensToFile error:", e);
+  }
+}
+
+// Load persisted tokens at startup
+const TOKENS_OBJ = loadTokensFromFile();
+const TOKENS = new Map(Object.entries(TOKENS_OBJ)); // key: userId, value: token obj
 
 // --- Auth middleware (Bearer) ---
 function auth(req, res, next) {
@@ -148,6 +181,7 @@ app.get("/oauth/google/callback", async (req, res) => {
     }
 
     TOKENS.set(userId, tokens);
+    saveTokensToFile(Object.fromEntries(TOKENS));
     console.log("Stored tokens for", userId);
     return res.send(
       `<html><body><h2>Sonny: Google connected ✅</h2>
@@ -215,6 +249,16 @@ app.post("/actions/create", auth, async (req, res) => {
   }
 });
 
+// --- Admin: list linked users (secured) ---
+app.get("/admin/tokens", auth, (_req, res) => {
+  try {
+    const users = [...TOKENS.keys()];
+    res.json({ ok: true, users, count: users.length, file: TOKENS_FILE });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 // --- Helpers ---
 function escapeForSSML(s) {
   return String(s).replace(/&/g, "and").replace(/[<>\"']/g, "");
@@ -241,6 +285,8 @@ function buildRfc822({ to, subject, text }) {
 // --- Start ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sonny Core listening on ${PORT}`));
+
+
 
 
 
