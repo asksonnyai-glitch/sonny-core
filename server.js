@@ -1,4 +1,4 @@
-// server.js — Sonny Core (Express + OpenAI + Google OAuth/Gmail + file persistence + Alexa/Twilio/Slack)
+// server.js — Sonny Core (Express + OpenAI + Google OAuth/Gmail + file persistence + Alexa/Twilio/Slack + Editable Persona)
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -22,16 +22,60 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "";
 
-// ---- File-based token persistence ----
+// ---- File paths ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const TOKENS_FILE =
-  process.env.TOKENS_FILE || path.join(__dirname, "data", "tokens.json");
+const TOKENS_FILE = process.env.TOKENS_FILE || path.join(__dirname, "data", "tokens.json");
+
+// ---- Editable persona (env/file) ----
+const PERSONA_FILE = process.env.PERSONA_FILE || path.join(__dirname, "data", "persona.json");
+const DEFAULT_PROMPT =
+  "You are Sonny, a warm mentor and spiritual guide rooted in Christian faith. " +
+  "When a user asks for Bible verses, provide 3–5 clear references (book, chapter, verse) with short quotes or summaries. " +
+  "Otherwise speak with compassion and practicality, in 2–5 short sentences suitable for voice. " +
+  "Avoid medical/legal/financial instructions; offer gentle disclaimers when needed and recommend consulting a professional. " +
+  "Keep responses PG-13, no profanity, no explicit content.";
 
 function ensureDirFor(filePath) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+function readJsonFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return {};
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw || "{}");
+  } catch (e) {
+    console.error("readJsonFile error:", e);
+    return {};
+  }
+}
+function writeJsonFile(filePath, obj) {
+  try {
+    ensureDirFor(filePath);
+    fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf8");
+  } catch (e) {
+    console.error("writeJsonFile error:", e);
+  }
+}
+
+// Persona helpers
+function readPersona() {
+  try {
+    if (process.env.PROMPT_SONNY && process.env.PROMPT_SONNY.trim()) {
+      return { prompt: process.env.PROMPT_SONNY.trim() };
+    }
+    return readJsonFile(PERSONA_FILE);
+  } catch (e) {
+    console.error("readPersona error:", e);
+    return {};
+  }
+}
+function writePersona(obj) {
+  writeJsonFile(PERSONA_FILE, obj);
+}
+
+// ---- Token persistence ----
 function loadTokensFromFile() {
   try {
     if (!fs.existsSync(TOKENS_FILE)) return {};
@@ -76,6 +120,10 @@ app.post("/voice/ingest", auth, async (req, res) => {
     const { text = "", sessionId = "", userId = "" } = req.body || {};
     const input = String(text || "").trim();
 
+    // Build prompt dynamically (pull from env/file each request)
+    const persona = readPersona();
+    const systemPrompt = (persona?.prompt && String(persona.prompt).trim()) || DEFAULT_PROMPT;
+
     // Fallback if OPENAI_API_KEY not set
     if (!OPENAI_API_KEY) {
       const ssml = input
@@ -89,11 +137,6 @@ app.post("/voice/ingest", auth, async (req, res) => {
       });
     }
 
-    const systemPrompt =
-      "You are Sonny, a warm mentor and spiritual guide rooted in Christian faith. " +
-      "Answer concisely in a kind, encouraging tone. Avoid preaching; be practical and gentle. " +
-      "Return answers suitable to be spoken out loud. Keep responses short (2–5 sentences).";
-
     const apiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -105,10 +148,7 @@ app.post("/voice/ingest", auth, async (req, res) => {
         temperature: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          {
-            role: "user",
-            content: input || "Greet the user briefly and ask how you can help.",
-          },
+          { role: "user", content: input || "Greet the user briefly and ask how you can help." },
         ],
       }),
     });
@@ -121,9 +161,7 @@ app.post("/voice/ingest", auth, async (req, res) => {
     }
 
     const data = await apiRes.json();
-    const reply =
-      data?.choices?.[0]?.message?.content ||
-      "I’m here. What would you like to do next?";
+    const reply = data?.choices?.[0]?.message?.content || "I’m here. What would you like to do next?";
     const ssml = wrapToSSML(reply);
 
     return res.json({
@@ -156,10 +194,7 @@ app.get("/oauth/google/start", (req, res) => {
       "profile",
     ].join(" ");
 
-    const state = Buffer.from(
-      JSON.stringify({ userId, ts: Date.now() })
-    ).toString("base64url");
-
+    const state = Buffer.from(JSON.stringify({ userId, ts: Date.now() })).toString("base64url");
     const params = new URLSearchParams({
       client_id: GOOGLE_CLIENT_ID,
       redirect_uri: GOOGLE_REDIRECT_URI,
@@ -170,7 +205,8 @@ app.get("/oauth/google/start", (req, res) => {
       state,
     });
 
-    const url = `https://accounts.google.com/o/oaut h2/v2/auth?${params.toString()}`;
+    // fixed: oauth2 URL (no space)
+    const url = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
     return res.redirect(url);
   } catch (e) {
     console.error("oauth start error:", e);
@@ -183,11 +219,8 @@ app.get("/oauth/google/callback", async (req, res) => {
   try {
     const code = String(req.query.code || "");
     const stateRaw = String(req.query.state || "");
-    const state = JSON.parse(
-      Buffer.from(stateRaw, "base64url").toString("utf8")
-    );
+    const state = JSON.parse(Buffer.from(stateRaw, "base64url").toString("utf8"));
     const userId = String(state?.userId || "anon");
-
     if (!code) return res.status(400).send("Missing code");
 
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
@@ -212,8 +245,7 @@ app.get("/oauth/google/callback", async (req, res) => {
     saveTokensToFile(Object.fromEntries(TOKENS));
     console.log("Stored tokens for", userId);
     return res.send(
-      `<html><body><h2>Sonny: Google connected ✅</h2>
-       <p>You can close this tab.</p></body></html>`
+      `<html><body><h2>Sonny: Google connected ✅</h2><p>You can close this tab.</p></body></html>`
     );
   } catch (e) {
     console.error("oauth callback error:", e);
@@ -226,26 +258,20 @@ app.get("/gmail/profile", auth, async (req, res) => {
   try {
     const userId = String(req.query.userId || "anon");
     const tokens = TOKENS.get(userId);
-    if (!tokens?.access_token)
-      return res.status(401).json({ ok: false, error: "not_linked" });
+    if (!tokens?.access_token) return res.status(401).json({ ok: false, error: "not_linked" });
 
-    const gRes = await fetch(
-      "https://gmail.googleapis.com/gmail/v1/users/me/profile",
-      { headers: { Authorization: `Bearer ${tokens.access_token}` } }
-    );
+    const gRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
     const data = await gRes.json();
     if (!gRes.ok) {
       console.error("gmail profile error:", data);
-      return res
-        .status(500)
-        .json({ ok: false, error: "gmail_profile_failed", detail: data });
+      return res.status(500).json({ ok: false, error: "gmail_profile_failed", detail: data });
     }
     return res.json({ ok: true, profile: data });
   } catch (e) {
     console.error("gmail profile exception:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: "gmail_profile_exception" });
+    return res.status(500).json({ ok: false, error: "gmail_profile_exception" });
   }
 });
 
@@ -274,39 +300,24 @@ app.post("/actions/create", auth, async (req, res) => {
       });
     }
 
-    const raw = buildRfc822({
-      to,
-      subject,
-      text: body || details || `Topic: ${topic}`,
+    const raw = buildRfc822({ to, subject, text: body || details || `Topic: ${topic}` });
+    const sendRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokens.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ raw }),
     });
-    const sendRes = await fetch(
-      "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokens.access_token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ raw }),
-      }
-    );
     const data = await sendRes.json();
     if (!sendRes.ok) {
       console.error("gmail send error:", data);
-      return res
-        .status(500)
-        .json({ ok: false, error: "gmail_send_failed", detail: data });
+      return res.status(500).json({ ok: false, error: "gmail_send_failed", detail: data });
     }
-    return res.json({
-      ok: true,
-      id: data?.id || `msg_${Date.now()}`,
-      status: "sent",
-    });
+    return res.json({ ok: true, id: data?.id || `msg_${Date.now()}`, status: "sent" });
   } catch (e) {
     console.error("actions.create error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: "actions_create_exception" });
+    return res.status(500).json({ ok: false, error: "actions_create_exception" });
   }
 });
 
@@ -320,17 +331,49 @@ app.get("/admin/tokens", auth, (_req, res) => {
   }
 });
 
-// --- Alexa endpoint: returns SSML (no auth) ---
+// --- Admin: get persona (secured) ---
+app.get("/admin/persona", auth, (_req, res) => {
+  const persona = readPersona();
+  const source = process.env.PROMPT_SONNY?.trim()
+    ? "env"
+    : (fs.existsSync(PERSONA_FILE) ? "file" : "default");
+  res.json({ ok: true, source, file: PERSONA_FILE, persona });
+});
+
+// --- Admin: update persona (secured) — accepts JSON { prompt, voice?, ssml? }
+app.put("/admin/persona", auth, (req, res) => {
+  try {
+    if (process.env.PROMPT_SONNY?.trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: "PROMPT_SONNY_env_set",
+        message: "Clear PROMPT_SONNY to allow file updates.",
+      });
+    }
+    const body = req.body || {};
+    if (!body.prompt || !String(body.prompt).trim()) {
+      return res.status(400).json({ ok: false, error: "missing_prompt" });
+    }
+    const current = readPersona();
+    const updated = { ...current, ...body, prompt: String(body.prompt).trim() };
+    writePersona(updated);
+    return res.json({ ok: true, file: PERSONA_FILE, persona: updated });
+  } catch (e) {
+    console.error("persona update error:", e);
+    return res.status(500).json({ ok: false, error: "persona_update_failed" });
+  }
+});
+
+// --- Alexa endpoint: returns SSML (no auth), uses persona greeting if set ---
 app.post("/alexa", (req, res) => {
-  const ssml =
-    `<speak>` +
-    `Hello, I am Sonny. <break time="400ms"/> ` +
-    `How can I help you today?` +
-    `</speak>`;
+  const p = readPersona();
+  const greeting =
+    p?.ssml?.greeting ||
+    `<speak>Hello, I am Sonny. <break time="400ms"/> How can I help you today?</speak>`;
   res.json({
     version: "1.0",
     response: {
-      outputSpeech: { type: "SSML", ssml },
+      outputSpeech: { type: "SSML", ssml: greeting },
       shouldEndSession: false,
     },
     sessionAttributes: {},
@@ -345,12 +388,7 @@ app.post("/twilio/sms", (req, res) => {
   // Respond with simple TwiML (Twilio expects XML)
   res
     .type("text/xml")
-    .send(
-      `<Response><Message>Hi, this is Sonny. You said: ${String(body).slice(
-        0,
-        300
-      )}</Message></Response>`
-    );
+    .send(`<Response><Message>Hi, this is Sonny. You said: ${String(body).slice(0, 300)}</Message></Response>`);
 });
 
 // --- Slack Events (no auth; URL verification + basic ack) ---
@@ -370,11 +408,7 @@ function wrapToSSML(text) {
   return `<speak><p>${safe}</p></speak>`;
 }
 function base64url(input) {
-  return Buffer.from(input)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return Buffer.from(input).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 function buildRfc822({ to, subject, text }) {
   const lines = [
@@ -391,6 +425,8 @@ function buildRfc822({ to, subject, text }) {
 // --- Start ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sonny Core listening on ${PORT}`));
+
+
 
 
 
