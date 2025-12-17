@@ -1,4 +1,4 @@
-// server.js — Sonny Core (Express + ChatGPT + Google OAuth/Gmail + file persistence)
+// server.js — Sonny Core (Express + OpenAI + Google OAuth/Gmail + file persistence + Alexa/Twilio/Slack)
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -6,14 +6,16 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
+// --- App & middleware ---
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // for Twilio form posts
 app.use(morgan("tiny"));
 
 // ---- Env ----
-const API_KEY = process.env.API_KEY || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const API_KEY = process.env.API_KEY || ""; // set on Render
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // optional: used by /voice/ingest
 
 // Google OAuth env
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -23,7 +25,8 @@ const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "";
 // ---- File-based token persistence ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const TOKENS_FILE = process.env.TOKENS_FILE || path.join(__dirname, "data", "tokens.json");
+const TOKENS_FILE =
+  process.env.TOKENS_FILE || path.join(__dirname, "data", "tokens.json");
 
 function ensureDirFor(filePath) {
   const dir = path.dirname(filePath);
@@ -48,11 +51,11 @@ function saveTokensToFile(obj) {
   }
 }
 
-// Load persisted tokens at startup
+// Load persisted tokens at startup (Map<userId, tokenObj>)
 const TOKENS_OBJ = loadTokensFromFile();
-const TOKENS = new Map(Object.entries(TOKENS_OBJ)); // key: userId, value: token obj
+const TOKENS = new Map(Object.entries(TOKENS_OBJ));
 
-// --- Auth middleware (Bearer) ---
+// --- Auth middleware (Bearer API_KEY) ---
 function auth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -73,11 +76,17 @@ app.post("/voice/ingest", auth, async (req, res) => {
     const { text = "", sessionId = "", userId = "" } = req.body || {};
     const input = String(text || "").trim();
 
+    // Fallback if OPENAI_API_KEY not set
     if (!OPENAI_API_KEY) {
       const ssml = input
-        ? `<speak><p>You said: ${escapeForSSML(input)}.</p><p>I'm here—what would you like to do next?</p></speak>`
+        ? `<speak><p>You said: ${escapeForSSML(input)}.</p><p>I’m here—what would you like to do next?</p></speak>`
         : `<speak>Hello, I am Sonny. How can I help?</speak>`;
-      return res.json({ ok: true, ssml, session: { sessionId, userId }, model: "fallback" });
+      return res.json({
+        ok: true,
+        ssml,
+        session: { sessionId, userId },
+        model: "fallback",
+      });
     }
 
     const systemPrompt =
@@ -88,17 +97,20 @@ app.post("/voice/ingest", auth, async (req, res) => {
     const apiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: input || "Greet the user briefly and ask how you can help." }
-        ]
-      })
+          {
+            role: "user",
+            content: input || "Greet the user briefly and ask how you can help.",
+          },
+        ],
+      }),
     });
 
     if (!apiRes.ok) {
@@ -109,13 +121,23 @@ app.post("/voice/ingest", auth, async (req, res) => {
     }
 
     const data = await apiRes.json();
-    const reply = data?.choices?.[0]?.message?.content || "I'm here. What would you like to do next?";
+    const reply =
+      data?.choices?.[0]?.message?.content ||
+      "I’m here. What would you like to do next?";
     const ssml = wrapToSSML(reply);
 
-    return res.json({ ok: true, ssml, session: { sessionId, userId }, model: "gpt-4o-mini" });
+    return res.json({
+      ok: true,
+      ssml,
+      session: { sessionId, userId },
+      model: "gpt-4o-mini",
+    });
   } catch (e) {
     console.error("ingest error:", e);
-    return res.json({ ok: false, ssml: "<speak>Sorry, something went wrong.</speak>" });
+    return res.json({
+      ok: false,
+      ssml: "<speak>Sorry, something went wrong.</speak>",
+    });
   }
 });
 
@@ -131,10 +153,13 @@ app.get("/oauth/google/start", (req, res) => {
       "https://www.googleapis.com/auth/gmail.readonly",
       "openid",
       "email",
-      "profile"
+      "profile",
     ].join(" ");
 
-    const state = Buffer.from(JSON.stringify({ userId, ts: Date.now() })).toString("base64url");
+    const state = Buffer.from(
+      JSON.stringify({ userId, ts: Date.now() })
+    ).toString("base64url");
+
     const params = new URLSearchParams({
       client_id: GOOGLE_CLIENT_ID,
       redirect_uri: GOOGLE_REDIRECT_URI,
@@ -142,9 +167,10 @@ app.get("/oauth/google/start", (req, res) => {
       access_type: "offline",
       prompt: "consent",
       scope,
-      state
+      state,
     });
-    const url = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+
+    const url = `https://accounts.google.com/o/oaut h2/v2/auth?${params.toString()}`;
     return res.redirect(url);
   } catch (e) {
     console.error("oauth start error:", e);
@@ -157,7 +183,9 @@ app.get("/oauth/google/callback", async (req, res) => {
   try {
     const code = String(req.query.code || "");
     const stateRaw = String(req.query.state || "");
-    const state = JSON.parse(Buffer.from(stateRaw, "base64url").toString("utf8"));
+    const state = JSON.parse(
+      Buffer.from(stateRaw, "base64url").toString("utf8")
+    );
     const userId = String(state?.userId || "anon");
 
     if (!code) return res.status(400).send("Missing code");
@@ -170,8 +198,8 @@ app.get("/oauth/google/callback", async (req, res) => {
         client_id: GOOGLE_CLIENT_ID,
         client_secret: GOOGLE_CLIENT_SECRET,
         redirect_uri: GOOGLE_REDIRECT_URI,
-        grant_type: "authorization_code"
-      })
+        grant_type: "authorization_code",
+      }),
     });
 
     const tokens = await tokenRes.json();
@@ -198,54 +226,87 @@ app.get("/gmail/profile", auth, async (req, res) => {
   try {
     const userId = String(req.query.userId || "anon");
     const tokens = TOKENS.get(userId);
-    if (!tokens?.access_token) return res.status(401).json({ ok: false, error: "not_linked" });
+    if (!tokens?.access_token)
+      return res.status(401).json({ ok: false, error: "not_linked" });
 
-    const gRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-      headers: { Authorization: `Bearer ${tokens.access_token}` }
-    });
+    const gRes = await fetch(
+      "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+      { headers: { Authorization: `Bearer ${tokens.access_token}` } }
+    );
     const data = await gRes.json();
     if (!gRes.ok) {
       console.error("gmail profile error:", data);
-      return res.status(500).json({ ok: false, error: "gmail_profile_failed", detail: data });
+      return res
+        .status(500)
+        .json({ ok: false, error: "gmail_profile_failed", detail: data });
     }
     return res.json({ ok: true, profile: data });
   } catch (e) {
     console.error("gmail profile exception:", e);
-    return res.status(500).json({ ok: false, error: "gmail_profile_exception" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "gmail_profile_exception" });
   }
 });
 
 // --- Actions: create (email supported) ---
 app.post("/actions/create", auth, async (req, res) => {
   try {
-    const { userId = "anon", type = "note", topic = "", details = "", to = "", subject = "", body = "" } = req.body || {};
+    const {
+      userId = "anon",
+      type = "note",
+      topic = "",
+      details = "",
+      to = "",
+      subject = "",
+      body = "",
+    } = req.body || {};
     if (type !== "email") {
       return res.json({ ok: true, id: `act_${Date.now()}`, type, status: "queued" });
     }
 
     const tokens = TOKENS.get(userId);
     if (!tokens?.access_token) {
-      return res.status(401).json({ ok: false, error: "not_linked", message: "Please link Gmail at /oauth/google/start?userId=YOU" });
+      return res.status(401).json({
+        ok: false,
+        error: "not_linked",
+        message: "Please link Gmail at /oauth/google/start?userId=YOU",
+      });
     }
 
-    const raw = buildRfc822({ to, subject, text: body || details || `Topic: ${topic}` });
-    const sendRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokens.access_token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ raw })
+    const raw = buildRfc822({
+      to,
+      subject,
+      text: body || details || `Topic: ${topic}`,
     });
+    const sendRes = await fetch(
+      "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tokens.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ raw }),
+      }
+    );
     const data = await sendRes.json();
     if (!sendRes.ok) {
       console.error("gmail send error:", data);
-      return res.status(500).json({ ok: false, error: "gmail_send_failed", detail: data });
+      return res
+        .status(500)
+        .json({ ok: false, error: "gmail_send_failed", detail: data });
     }
-    return res.json({ ok: true, id: data?.id || `msg_${Date.now()}`, status: "sent" });
+    return res.json({
+      ok: true,
+      id: data?.id || `msg_${Date.now()}`,
+      status: "sent",
+    });
   } catch (e) {
     console.error("actions.create error:", e);
-    return res.status(500).json({ ok: false, error: "actions_create_exception" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "actions_create_exception" });
   }
 });
 
@@ -259,6 +320,47 @@ app.get("/admin/tokens", auth, (_req, res) => {
   }
 });
 
+// --- Alexa endpoint: returns SSML (no auth) ---
+app.post("/alexa", (req, res) => {
+  const ssml =
+    `<speak>` +
+    `Hello, I am Sonny. <break time="400ms"/> ` +
+    `How can I help you today?` +
+    `</speak>`;
+  res.json({
+    version: "1.0",
+    response: {
+      outputSpeech: { type: "SSML", ssml },
+      shouldEndSession: false,
+    },
+    sessionAttributes: {},
+  });
+});
+
+// --- Twilio SMS webhook (no auth; form-encoded) ---
+app.post("/twilio/sms", (req, res) => {
+  const from = req.body?.From;
+  const body = req.body?.Body || "";
+  console.log("SMS from", from, "says:", body);
+  // Respond with simple TwiML (Twilio expects XML)
+  res
+    .type("text/xml")
+    .send(
+      `<Response><Message>Hi, this is Sonny. You said: ${String(body).slice(
+        0,
+        300
+      )}</Message></Response>`
+    );
+});
+
+// --- Slack Events (no auth; URL verification + basic ack) ---
+app.post("/slack/events", (req, res) => {
+  if (req.body?.type === "url_verification") {
+    return res.send(req.body.challenge);
+  }
+  res.sendStatus(200);
+});
+
 // --- Helpers ---
 function escapeForSSML(s) {
   return String(s).replace(/&/g, "and").replace(/[<>\"']/g, "");
@@ -268,16 +370,20 @@ function wrapToSSML(text) {
   return `<speak><p>${safe}</p></speak>`;
 }
 function base64url(input) {
-  return Buffer.from(input).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 function buildRfc822({ to, subject, text }) {
   const lines = [
     `To: ${to}`,
-    "Content-Type: text/plain; charset=\"UTF-8\"",
+    'Content-Type: text/plain; charset="UTF-8"',
     "MIME-Version: 1.0",
     `Subject: ${subject}`,
     "",
-    text
+    text,
   ].join("\r\n");
   return base64url(lines);
 }
@@ -285,6 +391,8 @@ function buildRfc822({ to, subject, text }) {
 // --- Start ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sonny Core listening on ${PORT}`));
+
+
 
 
 
